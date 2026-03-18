@@ -2,8 +2,7 @@ import os
 import traceback
 import csv
 import time
-from statistics import mean
-from genedesign.seq_utils.translate import Translate
+from genedesign.seq_utils.Translate import Translate
 from genedesign.transcript_designer import TranscriptDesigner
 from genedesign.checkers.forbidden_sequence_checker import ForbiddenSequenceChecker
 from genedesign.checkers.internal_promoter_checker import PromoterChecker
@@ -86,7 +85,10 @@ def analyze_errors(error_results):
 
 def validate_transcripts(successful_results):
     """
-    Validate the successful transcripts using various checkers, now including CodonChecker.
+    Validate the successful transcripts using various checkers.
+    Returns (validation_failures, checker_passes) where checker_passes maps
+    checker name to count of sequences that passed. Sequences that crash the
+    designer never enter here, so they are implicit failures for all checks.
     """
     forbidden_checker = ForbiddenSequenceChecker()
     forbidden_checker.initiate()
@@ -94,24 +96,27 @@ def validate_transcripts(successful_results):
     promoter_checker.initiate()
     translator = Translate()
     translator.initiate()
-    codon_checker = CodonChecker()  # Initialize CodonChecker
-    codon_checker.initiate()  # Load the codon usage data
+    codon_checker = CodonChecker()
+    codon_checker.initiate()
 
     validation_failures = []
+    checker_passes = {
+        'translation': 0,
+        'forbidden': 0,
+        'hairpin': 0,
+        'promoter': 0,
+        'codon': 0,
+    }
+
     for result in successful_results:
         cds = ''.join(result['transcript'].codons)
         try:
-            # Check if CDS length is a multiple of 3
             if len(cds) % 3 != 0:
                 raise ValueError("CDS length is not a multiple of 3.")
-
-            # Verify that the translated protein matches the original protein
             original_protein = result['protein']
             translated_protein = translator.run(cds)
             if original_protein != translated_protein:
                 raise ValueError(f"Translation mismatch: Original {original_protein}, Translated {translated_protein}")
-
-            # Ensure CDS starts with valid start codon and ends with stop codon
             if not (cds.startswith(("ATG", "GTG", "TTG")) and cds.endswith(("TAA", "TGA", "TAG"))):
                 raise ValueError("CDS does not start with a valid start codon or end with a valid stop codon.")
         except ValueError as e:
@@ -123,10 +128,14 @@ def validate_transcripts(successful_results):
             })
             continue
 
-        # Validate against hairpins, forbidden sequences, and internal promoters
+        checker_passes['translation'] += 1
+
         transcript_dna = result['transcript'].rbs.utr.upper() + cds
+
         passed_hairpin, hairpin_string = hairpin_checker(transcript_dna)
-        if not passed_hairpin:
+        if passed_hairpin:
+            checker_passes['hairpin'] += 1
+        else:
             formatted_hairpin = hairpin_string.replace('\n', ' ').replace('"', "'")
             validation_failures.append({
                 'gene': result['gene'],
@@ -136,7 +145,9 @@ def validate_transcripts(successful_results):
             })
 
         passed_forbidden, forbidden_site = forbidden_checker.run(transcript_dna)
-        if not passed_forbidden:
+        if passed_forbidden:
+            checker_passes['forbidden'] += 1
+        else:
             validation_failures.append({
                 'gene': result['gene'],
                 'protein': result['protein'],
@@ -145,7 +156,9 @@ def validate_transcripts(successful_results):
             })
 
         passed_promoter, found_promoter = promoter_checker.run(transcript_dna)
-        if not passed_promoter:
+        if passed_promoter:
+            checker_passes['promoter'] += 1
+        else:
             validation_failures.append({
                 'gene': result['gene'],
                 'protein': result['protein'],
@@ -154,15 +167,17 @@ def validate_transcripts(successful_results):
             })
 
         codons_above_board, codon_diversity, rare_codon_count, cai_value = codon_checker.run(result['transcript'].codons)
-        if not codons_above_board:
+        if codons_above_board:
+            checker_passes['codon'] += 1
+        else:
             validation_failures.append({
                 'gene': result['gene'],
                 'protein': result['protein'],
                 'cds': cds,
                 'site': f"Codon usage check failed: Diversity={codon_diversity}, Rare Codons={rare_codon_count}, CAI={cai_value}"
             })
-    
-    return validation_failures
+
+    return validation_failures, checker_passes
 
 def write_validation_report(validation_failures):
     """
@@ -174,81 +189,124 @@ def write_validation_report(validation_failures):
         for failure in validation_failures:
             writer.writerow([failure['gene'], failure['protein'], failure['cds'], failure['site']])
 
-def generate_summary(total_genes, parsing_time, execution_time, errors_summary, validation_failures):
+def generate_grade_report(total_genes, checker_passes, parsing_time, execution_time, proteome_name):
     """
-    Generates a streamlined summary report categorizing validation failures by checker.
+    Generates a grade report with per-checker pass rates, thresholds, and a point score.
+    Prints the report and writes it to grade_report.txt.
+
+    Scoring table (55 pts total):
+      20 pts  Valid ORFs produced          >= 80%
+      20 pts  Forbidden sequence checker   >= 90%
+       5 pts  Codon checker (CAI/bias)     >= 90%
+       5 pts  Promoter checker             >= 90%
+       2 pts  Hairpin checker              >= 90%
+       2 pts  [6th check — TBD]            >= 90%
+       1 pt   All of the above             >= 99%
     """
-    total_validation_failures = len(validation_failures)
-    
-    # Categorize failures by checker type
-    checker_failures = {
-        'Forbidden Sequence Checker': 0,
-        'Hairpin Checker': 0,
-        'Codon Usage Checker': 0,
-        'Promoter Checker': 0,
-        'Translation/Completeness Checker': 0
+    THRESHOLDS = {
+        'translation': 0.80,
+        'forbidden':   0.90,
+        'codon':       0.90,
+        'promoter':    0.90,
+        'hairpin':     0.90,
+    }
+    MAX_POINTS = {
+        'translation': 20,
+        'forbidden':   20,
+        'codon':        5,
+        'promoter':     5,
+        'hairpin':      2,
+        'sixth':        2,
+        'all99':        1,
     }
 
-    # Increment the appropriate checker category based on the failure site
-    for failure in validation_failures:
-        site = failure['site']
-        if "Forbidden sequence" in site:
-            checker_failures['Forbidden Sequence Checker'] += 1
-        elif "Hairpin detected" in site:
-            checker_failures['Hairpin Checker'] += 1
-        elif "Codon usage check failed" in site:
-            checker_failures['Codon Usage Checker'] += 1
-        elif "Constitutive promoter detected" in site:
-            checker_failures['Promoter Checker'] += 1
-        elif "Translation or completeness error" in site:
-            checker_failures['Translation/Completeness Checker'] += 1
+    rates = {key: checker_passes[key] / total_genes for key in THRESHOLDS}
 
-    # Generate the summary report
-    with open('summary_report.txt', 'w') as f:
-        f.write(f"Total genes processed: {total_genes}\n")
-        f.write(f"Parsing runtime: {parsing_time:.2f} seconds\n")
-        f.write(f"Execution runtime: {execution_time:.2f} seconds\n")
-        f.write(f"Total exceptions: {sum(errors_summary.values())}\n")
+    score = 0
+    earned = {}
+    for key in THRESHOLDS:
+        pts = MAX_POINTS[key] if rates[key] >= THRESHOLDS[key] else 0
+        score += pts
+        earned[key] = pts
 
-        if errors_summary:
-            f.write(f"\nTop 3 most common exceptions:\n")
-            for error, count in sorted(errors_summary.items(), key=lambda x: x[1], reverse=True)[:3]:
-                f.write(f"- {error}: {count} occurrences\n")
-        else:
-            f.write("No exceptions encountered.\n")
+    # 6th check is not yet defined — placeholder, 0 pts
+    earned['sixth'] = 0
 
-        f.write(f"\nTotal validation failures: {total_validation_failures}\n")
+    # Bonus point if every defined check is >= 99%
+    all_above_99 = all(rates[k] >= 0.99 for k in THRESHOLDS)
+    if all_above_99:
+        score += MAX_POINTS['all99']
+    earned['all99'] = MAX_POINTS['all99'] if all_above_99 else 0
 
-        # Categorize validation failures by checker
-        f.write("\nValidation Failures by Checker:\n")
-        for checker, count in checker_failures.items():
-            f.write(f"- {checker}: {count} occurrences\n")
+    def _row(pts, max_pts, label, n, rate, threshold_pct, extra=""):
+        sign = "+" if pts > 0 else " "
+        status = "✓" if pts > 0 else "✗"
+        fail_note = f", {total_genes - n} failures" if pts == 0 and n is not None else ""
+        return (
+            f"[{sign}{pts:2d}/{max_pts}] {label:<26} {n}/{total_genes} "
+            f"({rate*100:.1f}%)  {status}  (threshold: >={threshold_pct}%{fail_note}){extra}"
+        )
+
+    total_runtime = parsing_time + execution_time
+    lines = [
+        "===== TranscriptDesigner Benchmarker Grade Report =====",
+        f"Proteome: {proteome_name} ({total_genes} proteins)",
+        "",
+        _row(earned['translation'], MAX_POINTS['translation'], "Valid ORFs:",
+             checker_passes['translation'], rates['translation'], 80),
+        _row(earned['forbidden'],   MAX_POINTS['forbidden'],   "Forbidden sequences:",
+             checker_passes['forbidden'],   rates['forbidden'],   90),
+        _row(earned['codon'],       MAX_POINTS['codon'],       "Codon bias:",
+             checker_passes['codon'],       rates['codon'],       90),
+        _row(earned['promoter'],    MAX_POINTS['promoter'],    "Promoters:",
+             checker_passes['promoter'],    rates['promoter'],    90),
+        _row(earned['hairpin'],     MAX_POINTS['hairpin'],     "Hairpins:",
+             checker_passes['hairpin'],     rates['hairpin'],     90),
+        f"[ +0/ 2] [6th check — TBD]:         N/A",
+        f"[{'+' if earned['all99'] else ' '}{earned['all99']:2d}/ 1] All checks >=99%:            "
+        f"{'yes  ✓' if all_above_99 else 'not yet  ✗'}",
+        "",
+        f"Benchmarker score:  {score} / 55",
+        f"Runtime:            {total_runtime:.1f} seconds",
+        "",
+        "Details: validation_failures.tsv",
+        "=======================================================",
+    ]
+
+    report = "\n".join(lines)
+    print(report)
+    with open('grade_report.txt', 'w') as f:
+        f.write(report + "\n")
 
 def run_benchmark(fasta_file):
     """
     Runs the complete benchmark process: parsing, running TranscriptDesigner, validating, and generating reports.
     """
-    start_time = time.time()
-    
+    proteome_name = os.path.splitext(os.path.basename(fasta_file))[0]
+
     # Benchmark the proteome
     parsing_start = time.time()
     successful_results, error_results = benchmark_proteome(fasta_file)
     parsing_time = time.time() - parsing_start
-    
-    # Analyze and log errors
-    errors_summary = analyze_errors(error_results)
-    
+
+    # Analyze and log exceptions to error_summary.txt
+    analyze_errors(error_results)
+
     # Validate the successful transcripts
     validation_start = time.time()
-    validation_failures = validate_transcripts(successful_results)
+    validation_failures, checker_passes = validate_transcripts(successful_results)
     execution_time = time.time() - validation_start
 
-    # Write validation and error reports
-    write_validation_report(validation_failures)
-    
-    # Generate the summary report
+    # Sequences that crashed the designer are implicit failures for every check.
+    # Fold their count into the translation (ORF) denominator by using total_genes
+    # as the denominator throughout; checker_passes already excludes crash victims.
     total_genes = len(successful_results) + len(error_results)
-    generate_summary(total_genes, parsing_time, execution_time, errors_summary, validation_failures)
+
+    # Write validation failures for instructor spot-checking
+    write_validation_report(validation_failures)
+
+    # Print and save the grade report
+    generate_grade_report(total_genes, checker_passes, parsing_time, execution_time, proteome_name)
 
 if __name__ == "__main__":
     fasta_file = "tests/benchmarking/uniprotkb_proteome_UP000054015_2024_09_24.fasta"
