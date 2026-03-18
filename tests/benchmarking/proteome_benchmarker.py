@@ -1,4 +1,5 @@
 import os
+import subprocess
 import traceback
 import csv
 import time
@@ -189,7 +190,83 @@ def write_validation_report(validation_failures):
         for failure in validation_failures:
             writer.writerow([failure['gene'], failure['protein'], failure['cds'], failure['site']])
 
-def generate_grade_report(total_genes, checker_passes, parsing_time, execution_time, proteome_name):
+def find_student_files(repo_root):
+    """
+    Detects the GitHub repo URL, current branch, and any files students added
+    beyond the original scaffold — new checkers and new tests.
+    Returns a dict with keys: base_url, branch, transcript_designer_url,
+    new_checkers (list of (filename, url)), new_tests (list of (filename, url)).
+    On any failure, returns None.
+    """
+    ORIGINAL_CHECKERS = {
+        'codon_checker.py',
+        'forbidden_sequence_checker.py',
+        'hairpin_checker.py',
+        'internal_promoter_checker.py',
+    }
+    ORIGINAL_TESTS = {
+        'test_codon_checker.py',
+        'test_forbidden_sequence_checker.py',
+        'test_internal_promoter_checker.py',
+        'test_operon_designer.py',
+        'test_transcript_designer.py',
+        'test_hairpin_counter.py',
+    }
+
+    try:
+        raw = subprocess.check_output(
+            ['git', 'remote', 'get-url', 'origin'],
+            cwd=repo_root, stderr=subprocess.DEVNULL
+        ).decode().strip()
+        # Normalise SSH → HTTPS and strip .git
+        if raw.startswith('git@github.com:'):
+            raw = 'https://github.com/' + raw[len('git@github.com:'):]
+        base_url = raw.removesuffix('.git')
+
+        branch = subprocess.check_output(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=repo_root, stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        return None
+
+    def gh(rel_path):
+        return f"{base_url}/blob/{branch}/{rel_path}"
+
+    # TranscriptDesigner is always at the same place
+    td_path = 'genedesign/transcript_designer.py'
+    result = {
+        'base_url': base_url,
+        'branch': branch,
+        'transcript_designer_url': gh(td_path),
+        'new_checkers': [],
+        'new_tests': [],
+    }
+
+    # Scan genedesign/checkers/ for anything not in the original set
+    checker_dir = os.path.join(repo_root, 'genedesign', 'checkers')
+    if os.path.isdir(checker_dir):
+        for fname in sorted(os.listdir(checker_dir)):
+            if fname.endswith('.py') and fname not in ORIGINAL_CHECKERS and fname != '__init__.py':
+                rel = f'genedesign/checkers/{fname}'
+                result['new_checkers'].append((fname, gh(rel)))
+
+    # Scan the whole tests tree for anything not in the original set
+    tests_dir = os.path.join(repo_root, 'tests')
+    if os.path.isdir(tests_dir):
+        for dirpath, _, filenames in os.walk(tests_dir):
+            for fname in sorted(filenames):
+                if fname.endswith('.py') and fname not in ORIGINAL_TESTS and fname != '__init__.py':
+                    # Skip the benchmarker itself
+                    if fname == 'proteome_benchmarker.py':
+                        continue
+                    rel = os.path.relpath(os.path.join(dirpath, fname), repo_root).replace(os.sep, '/')
+                    result['new_tests'].append((fname, gh(rel)))
+
+    return result
+
+
+def generate_grade_report(total_genes, checker_passes, parsing_time, execution_time, proteome_name, student_files=None):
     """
     Generates a grade report with per-checker pass rates, thresholds, and a point score.
     Prints the report and writes it to grade_report.txt.
@@ -222,56 +299,57 @@ def generate_grade_report(total_genes, checker_passes, parsing_time, execution_t
 
     rates = {key: checker_passes[key] / total_genes for key in THRESHOLDS}
 
-    score = 0
-    earned = {}
-    for key in THRESHOLDS:
-        pts = MAX_POINTS[key] if rates[key] >= THRESHOLDS[key] else 0
-        score += pts
-        earned[key] = pts
-
-    # 6th check is not yet defined — placeholder, 0 pts
-    earned['sixth'] = 0
+    score = sum(MAX_POINTS[k] for k in THRESHOLDS if rates[k] >= THRESHOLDS[k])
 
     # Bonus point if every defined check is >= 99%
     all_above_99 = all(rates[k] >= 0.99 for k in THRESHOLDS)
     if all_above_99:
         score += MAX_POINTS['all99']
-    earned['all99'] = MAX_POINTS['all99'] if all_above_99 else 0
+    all99_pts = MAX_POINTS['all99'] if all_above_99 else 0
 
-    def _row(pts, max_pts, label, n, rate, threshold_pct, extra=""):
-        sign = "+" if pts > 0 else " "
-        status = "✓" if pts > 0 else "✗"
-        fail_note = f", {total_genes - n} failures" if pts == 0 and n is not None else ""
+    def _row(label, n, rate, threshold_pct, max_pts):
+        pts = max_pts if rate >= threshold_pct / 100 else 0
+        status = "PASS ✓" if pts > 0 else "FAIL ✗"
+        fail_note = f" ({total_genes - n} failures)" if pts == 0 else ""
         return (
-            f"[{sign}{pts:2d}/{max_pts}] {label:<26} {n}/{total_genes} "
-            f"({rate*100:.1f}%)  {status}  (threshold: >={threshold_pct}%{fail_note}){extra}"
+            f"{label}: {n}/{total_genes} ({rate*100:.1f}%) — "
+            f"{status} threshold >={threshold_pct}% — {pts}/{max_pts} pts{fail_note}"
         )
 
     total_runtime = parsing_time + execution_time
     lines = [
-        "===== TranscriptDesigner Benchmarker Grade Report =====",
+        "TranscriptDesigner Benchmarker Grade Report",
         f"Proteome: {proteome_name} ({total_genes} proteins)",
         "",
-        _row(earned['translation'], MAX_POINTS['translation'], "Valid ORFs:",
-             checker_passes['translation'], rates['translation'], 80),
-        _row(earned['forbidden'],   MAX_POINTS['forbidden'],   "Forbidden sequences:",
-             checker_passes['forbidden'],   rates['forbidden'],   90),
-        _row(earned['codon'],       MAX_POINTS['codon'],       "Codon bias:",
-             checker_passes['codon'],       rates['codon'],       90),
-        _row(earned['promoter'],    MAX_POINTS['promoter'],    "Promoters:",
-             checker_passes['promoter'],    rates['promoter'],    90),
-        _row(earned['hairpin'],     MAX_POINTS['hairpin'],     "Hairpins:",
-             checker_passes['hairpin'],     rates['hairpin'],     90),
-        f"[ +0/ 2] [6th check — TBD]:         N/A",
-        f"[{'+' if earned['all99'] else ' '}{earned['all99']:2d}/ 1] All checks >=99%:            "
-        f"{'yes  ✓' if all_above_99 else 'not yet  ✗'}",
+        "--- Automated Score ---",
+        _row("Valid ORFs",         checker_passes['translation'], rates['translation'], 80,  MAX_POINTS['translation']),
+        _row("Forbidden sequences",checker_passes['forbidden'],   rates['forbidden'],   90,  MAX_POINTS['forbidden']),
+        _row("Codon bias",         checker_passes['codon'],       rates['codon'],       90,  MAX_POINTS['codon']),
+        _row("Promoters",          checker_passes['promoter'],    rates['promoter'],    90,  MAX_POINTS['promoter']),
+        _row("Hairpins",           checker_passes['hairpin'],     rates['hairpin'],     90,  MAX_POINTS['hairpin']),
+        "[6th check TBD] N/A — 0/2 pts",
+        f"All checks >=99%: {'yes ✓' if all_above_99 else 'not yet ✗'} — {all99_pts}/1 pts",
         "",
-        f"Benchmarker score:  {score} / 55",
-        f"Runtime:            {total_runtime:.1f} seconds",
+        f"Benchmarker score: {score} / 55",
+        f"Runtime: {total_runtime:.1f} seconds",
         "",
-        "Details: validation_failures.tsv",
-        "=======================================================",
+        "--- Code Links ---",
     ]
+
+    if student_files is None:
+        lines.append("[WARNING] Could not detect GitHub repo — add your repo URL here manually.")
+    else:
+        lines.append(f"TranscriptDesigner: {student_files['transcript_designer_url']}")
+        if student_files['new_checkers']:
+            for fname, url in student_files['new_checkers']:
+                lines.append(f"New checker — {fname}: {url}")
+        else:
+            lines.append("[WARNING] No new checker found in genedesign/checkers/")
+        if student_files['new_tests']:
+            for fname, url in student_files['new_tests']:
+                lines.append(f"New test — {fname}: {url}")
+        else:
+            lines.append("[WARNING] No new test file found in tests/")
 
     report = "\n".join(lines)
     print(report)
@@ -283,6 +361,10 @@ def run_benchmark(fasta_file):
     Runs the complete benchmark process: parsing, running TranscriptDesigner, validating, and generating reports.
     """
     proteome_name = os.path.splitext(os.path.basename(fasta_file))[0]
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(fasta_file))))
+
+    # Detect GitHub repo URL and any student-added files
+    student_files = find_student_files(repo_root)
 
     # Benchmark the proteome
     parsing_start = time.time()
@@ -305,8 +387,8 @@ def run_benchmark(fasta_file):
     # Write validation failures for instructor spot-checking
     write_validation_report(validation_failures)
 
-    # Print and save the grade report
-    generate_grade_report(total_genes, checker_passes, parsing_time, execution_time, proteome_name)
+    # Print and save the grade report (includes code links)
+    generate_grade_report(total_genes, checker_passes, parsing_time, execution_time, proteome_name, student_files)
 
 if __name__ == "__main__":
     fasta_file = "tests/benchmarking/uniprotkb_proteome_UP000054015_2024_09_24.fasta"
