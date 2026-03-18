@@ -309,29 +309,27 @@ def generate_grade_report(total_genes, checker_passes, parsing_time, execution_t
 
     def _row(label, n, rate, threshold_pct, max_pts):
         pts = max_pts if rate >= threshold_pct / 100 else 0
-        status = "PASS ✓" if pts > 0 else "FAIL ✗"
-        fail_note = f" ({total_genes - n} failures)" if pts == 0 else ""
-        return (
-            f"{label}: {n}/{total_genes} ({rate*100:.1f}%) — "
-            f"{status} threshold >={threshold_pct}% — {pts}/{max_pts} pts{fail_note}"
-        )
+        if pts > 0:
+            return f"[PASS] {label}: {n}/{total_genes} ({rate*100:.1f}%) — {pts}/{max_pts} pts"
+        else:
+            return (f"[FAIL] {label}: {n}/{total_genes} ({rate*100:.1f}%) — 0/{max_pts} pts"
+                    f" — needs >={threshold_pct}%, {total_genes - n} failures")
 
     total_runtime = parsing_time + execution_time
     lines = [
         "TranscriptDesigner Benchmarker Grade Report",
         f"Proteome: {proteome_name} ({total_genes} proteins)",
-        "",
-        "--- Automated Score ---",
-        _row("Valid ORFs",         checker_passes['translation'], rates['translation'], 80,  MAX_POINTS['translation']),
-        _row("Forbidden sequences",checker_passes['forbidden'],   rates['forbidden'],   90,  MAX_POINTS['forbidden']),
-        _row("Codon bias",         checker_passes['codon'],       rates['codon'],       90,  MAX_POINTS['codon']),
-        _row("Promoters",          checker_passes['promoter'],    rates['promoter'],    90,  MAX_POINTS['promoter']),
-        _row("Hairpins",           checker_passes['hairpin'],     rates['hairpin'],     90,  MAX_POINTS['hairpin']),
-        "[6th check TBD] N/A — 0/2 pts",
-        f"All checks >=99%: {'yes ✓' if all_above_99 else 'not yet ✗'} — {all99_pts}/1 pts",
-        "",
-        f"Benchmarker score: {score} / 55",
         f"Runtime: {total_runtime:.1f} seconds",
+        "",
+        f"SCORE: {score} / 55",
+        "",
+        _row("Valid ORFs",          checker_passes['translation'], rates['translation'], 80,  MAX_POINTS['translation']),
+        _row("Forbidden sequences", checker_passes['forbidden'],   rates['forbidden'],   90,  MAX_POINTS['forbidden']),
+        _row("Codon bias",          checker_passes['codon'],       rates['codon'],       90,  MAX_POINTS['codon']),
+        _row("Promoters",           checker_passes['promoter'],    rates['promoter'],    90,  MAX_POINTS['promoter']),
+        _row("Hairpins",            checker_passes['hairpin'],     rates['hairpin'],     90,  MAX_POINTS['hairpin']),
+        "[ N/A] 6th check (TBD) — 0/2 pts",
+        f"[{'PASS' if all_above_99 else 'FAIL'}] All checks >=99% bonus — {all99_pts}/1 pts",
         "",
         "--- Code Links ---",
     ]
